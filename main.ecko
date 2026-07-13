@@ -1,0 +1,88 @@
+# redis - a Redis client (RESP2) written in pure Ecko.
+#
+# No native code: it frames the wire protocol over std.net's raw sockets
+# (connect / connect_tls, send, recv_until, recv_exact) plus the bytes type.
+# The entrypoint of the `redis` package; `export` declares its public API.
+
+import std.net
+
+export { connect, connect_tls, close, command, encode, ping, set, get, del, incr, decr, exists, expire, ttl, keys, lpush, rpush, lrange }
+
+# --- RESP encoding: a command is an array of bulk strings ------------------
+# Bulk length is a BYTE count, so a string is framed by its UTF-8 length.
+
+fn arg_bytes(a) = if type_of(a) == "bytes" { a } else { bytes(string(a)) }
+
+# encode(parts) -> the RESP bytes for a command. Public so you can build a
+# custom command or inspect the wire format without sending it.
+fn encode(parts) {
+    mut out = bytes("*" + string(len(parts)) + "\r\n")
+    for p in parts {
+        pb = arg_bytes(p)
+        out = out + bytes("$" + string(len(pb)) + "\r\n") + pb + bytes("\r\n")
+    }
+    out
+}
+
+# --- RESP decoding: read exactly one reply, recursing for arrays -----------
+# recv_until gives the type line (through CRLF); bulk payloads are read with
+# recv_exact by their declared length. Bulk values decode as UTF-8 text (the
+# common case); a binary-safe variant would return the raw bytes instead.
+#
+# RESP type bytes: 43 '+' simple string, 58 ':' integer, 45 '-' error,
+# 36 '$' bulk string (length-prefixed; -1 = nil), 42 '*' array (-1 = nil).
+fn read_reply(sock) {
+    line = net.recv_until(sock, b"\r\n")
+    kind = line[0]
+    body = string(line[1..len(line) - 2])
+    match kind {
+        43 => body
+        58 => int(body)
+        45 => error({ kind: "redis", message: body })
+        36 => {
+            n = int(body)
+            if n == -1 { null } else {
+                data = net.recv_exact(sock, n + 2)
+                string(data[0..n])
+            }
+        }
+        42 => {
+            n = int(body)
+            if n == -1 { null } else {
+                mut items = []
+                for i in range(0, n) {
+                    items = push(items, read_reply(sock))
+                }
+                items
+            }
+        }
+        _ => error({ kind: "redis", message: "unknown RESP type: " + string(kind) })
+    }
+}
+
+# --- the client surface ----------------------------------------------------
+
+fn connect(host, port) = net.connect(host, port)
+fn connect_tls(host, port) = net.connect_tls(host, port)
+fn close(sock) = net.close(sock)
+
+# command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
+# and you can call it directly for commands without a helper.
+fn command(sock, parts) {
+    net.send(sock, encode(parts))
+    read_reply(sock)
+}
+
+fn ping(sock) = command(sock, ["PING"])
+fn set(sock, key, value) = command(sock, ["SET", key, value])
+fn get(sock, key) = command(sock, ["GET", key])
+fn del(sock, key) = command(sock, ["DEL", key])
+fn incr(sock, key) = command(sock, ["INCR", key])
+fn decr(sock, key) = command(sock, ["DECR", key])
+fn exists(sock, key) = command(sock, ["EXISTS", key])
+fn expire(sock, key, secs) = command(sock, ["EXPIRE", key, secs])
+fn ttl(sock, key) = command(sock, ["TTL", key])
+fn keys(sock, pattern) = command(sock, ["KEYS", pattern])
+fn lpush(sock, key, value) = command(sock, ["LPUSH", key, value])
+fn rpush(sock, key, value) = command(sock, ["RPUSH", key, value])
+fn lrange(sock, key, start, stop) = command(sock, ["LRANGE", key, start, stop])

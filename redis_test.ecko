@@ -1,0 +1,28 @@
+# Offline tests, run by `ecko test` (mock mode, no server needed). These cover
+# the RESP *encoding* - the parts that don't touch a socket. The full
+# request/response round trip (decoding) is exercised by example.ecko against a
+# live server.
+import std.test
+import "./main.ecko"
+
+test.case("encodes a no-arg command", || {
+    test.eq(main.encode(["PING"]), b"*1\r\n$4\r\nPING\r\n")
+})
+
+test.case("encodes a multi-arg command", || {
+    test.eq(main.encode(["SET", "k", "v"]), b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+})
+
+test.case("frames by UTF-8 BYTE length, not char count", || {
+    # "café" is 5 bytes (é is 2), so the bulk length is 5, not 4.
+    test.eq(main.encode(["GET", "café"]), b"*2\r\n$3\r\nGET\r\n$5\r\ncaf\xc3\xa9\r\n")
+})
+
+test.case("coerces non-string args", || {
+    # An integer argument is sent as its decimal text.
+    test.eq(main.encode(["EXPIRE", "k", 60]), b"*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n")
+})
+
+test.case("passes bytes through untouched", || {
+    test.eq(main.encode(["SET", "k", b"\x00\xff"]), b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\n\x00\xff\r\n")
+})

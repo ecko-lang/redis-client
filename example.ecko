@@ -1,0 +1,35 @@
+# A live round-trip against a real Redis on 127.0.0.1:6379. Run it directly:
+#
+#   ecko example.ecko
+#
+# (Not part of `ecko test`, which is offline - this needs a running server.)
+# Uses an `ecko:example:*` key prefix and cleans up after itself.
+
+import "./main.ecko"
+
+r = main.connect("127.0.0.1", 6379)  # or main.connect_tls(host, port)
+
+print("PING -> " + main.ping(r))
+
+k = "ecko:example:greeting"
+print("SET -> " + main.set(r, k, "hello from pure Ecko"))
+print("GET -> " + main.get(r, k))
+print("EXISTS -> " + string(main.exists(r, k)))
+
+c = "ecko:example:counter"
+main.set(r, c, "0")
+main.incr(r, c)
+main.incr(r, c)
+print("INCR x2 -> " + main.get(r, c))
+
+lk = "ecko:example:fruit"
+main.del(r, lk)
+main.rpush(r, lk, "apple")
+main.rpush(r, lk, "banana")
+print("LRANGE -> " + string(main.lrange(r, lk, 0, -1)))
+
+print("GET missing -> " + string(main.get(r, "ecko:example:nope")))
+
+print("DEL cleanup -> " + string(main.del(r, k) + main.del(r, c) + main.del(r, lk)))
+main.close(r)
+print("done")
