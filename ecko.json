@@ -1,8 +1,8 @@
 {
   "name": "redis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entrypoint": "main.ecko",
-  "description": "A Redis client (RESP2) written in pure Ecko, over std.net raw sockets + TLS.",
+  "description": "A Redis client (RESP2) written in Ecko, over std.net raw sockets + TLS.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
   "license": "MIT",
   "capabilities": ["net"],

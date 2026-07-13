@@ -1,23 +1,25 @@
-# redis
+# Redis Client
 
-A Redis client (RESP2) for [Ecko](https://ecko.sh), written in pure Ecko -
-no native code. It frames the wire protocol over `std.net`'s raw sockets
+A Redis client (RESP2) for [Ecko](https://ecko.sh), written in Ecko. It frames the wire protocol over `std.net`'s raw sockets
 (`connect` / `connect_tls`, `send`, `recv_until`, `recv_exact`) and the `bytes`
 type.
 
 ## Install
 
 ```bash
-ecko add https://.../redis.zip   # or a local path / git URL
+ecko add https://github.com/ecko-sh/redis-client
 ```
 
 `ecko add` vendors the package into your project's `./vendor/redis/` and pins it
-in `ecko.lock`. Grant it the network capability in your `ecko.json`:
+by SHA-256 in `ecko.lock`. Grant it the network capability in your `ecko.json`:
 
 ```json
 {
   "dependencies": {
-    "redis": { "source": "...", "grant": ["net"] }
+    "redis": {
+      "source": "https://github.com/ecko-sh/redis-client",
+      "grant": ["net"]
+    }
   }
 }
 ```
