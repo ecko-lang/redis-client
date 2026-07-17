@@ -6,8 +6,6 @@
 
 import std.net
 
-export { connect, connect_tls, close, command, encode, ping, set, get, del, incr, decr, exists, expire, ttl, keys, lpush, rpush, lrange }
-
 # --- RESP encoding: a command is an array of bulk strings ------------------
 # Bulk length is a BYTE count, so a string is framed by its UTF-8 length.
 
@@ -15,7 +13,7 @@ fn arg_bytes(a) = if type_of(a) == "bytes" { a } else { bytes(string(a)) }
 
 # encode(parts) -> the RESP bytes for a command. Public so you can build a
 # custom command or inspect the wire format without sending it.
-fn encode(parts) {
+export fn encode(parts) {
     mut out = bytes("*" + string(len(parts)) + "\r\n")
     for p in parts {
         pb = arg_bytes(p)
@@ -62,27 +60,27 @@ fn read_reply(sock) {
 
 # --- the client surface ----------------------------------------------------
 
-fn connect(host, port) = net.connect(host, port)
-fn connect_tls(host, port) = net.connect_tls(host, port)
-fn close(sock) = net.close(sock)
+export fn connect(host, port) = net.connect(host, port)
+export fn connect_tls(host, port) = net.connect_tls(host, port)
+export fn close(sock) = net.close(sock)
 
 # command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
 # and you can call it directly for commands without a helper.
-fn command(sock, parts) {
+export fn command(sock, parts) {
     net.send(sock, encode(parts))
     read_reply(sock)
 }
 
-fn ping(sock) = command(sock, ["PING"])
-fn set(sock, key, value) = command(sock, ["SET", key, value])
-fn get(sock, key) = command(sock, ["GET", key])
-fn del(sock, key) = command(sock, ["DEL", key])
-fn incr(sock, key) = command(sock, ["INCR", key])
-fn decr(sock, key) = command(sock, ["DECR", key])
-fn exists(sock, key) = command(sock, ["EXISTS", key])
-fn expire(sock, key, secs) = command(sock, ["EXPIRE", key, secs])
-fn ttl(sock, key) = command(sock, ["TTL", key])
-fn keys(sock, pattern) = command(sock, ["KEYS", pattern])
-fn lpush(sock, key, value) = command(sock, ["LPUSH", key, value])
-fn rpush(sock, key, value) = command(sock, ["RPUSH", key, value])
-fn lrange(sock, key, start, stop) = command(sock, ["LRANGE", key, start, stop])
+export fn ping(sock) = command(sock, ["PING"])
+export fn set(sock, key, value) = command(sock, ["SET", key, value])
+export fn get(sock, key) = command(sock, ["GET", key])
+export fn del(sock, key) = command(sock, ["DEL", key])
+export fn incr(sock, key) = command(sock, ["INCR", key])
+export fn decr(sock, key) = command(sock, ["DECR", key])
+export fn exists(sock, key) = command(sock, ["EXISTS", key])
+export fn expire(sock, key, secs) = command(sock, ["EXPIRE", key, secs])
+export fn ttl(sock, key) = command(sock, ["TTL", key])
+export fn keys(sock, pattern) = command(sock, ["KEYS", pattern])
+export fn lpush(sock, key, value) = command(sock, ["LPUSH", key, value])
+export fn rpush(sock, key, value) = command(sock, ["RPUSH", key, value])
+export fn lrange(sock, key, start, stop) = command(sock, ["LRANGE", key, start, stop])
