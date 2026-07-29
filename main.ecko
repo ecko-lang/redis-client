@@ -11,8 +11,8 @@ import std.net
 
 fn arg_bytes(a) = if type_of(a) == "bytes" { a } else { bytes(string(a)) }
 
-# encode(parts) -> the RESP bytes for a command. Public so you can build a
-# custom command or inspect the wire format without sending it.
+## encode(parts) -> the RESP bytes for a command. Public so you can build a
+## custom command or inspect the wire format without sending it.
 export fn encode(parts) {
     mut out = bytes("*" + string(len(parts)) + "\r\n")
     for p in parts {
@@ -60,27 +60,53 @@ fn read_reply(sock) {
 
 # --- the client surface ----------------------------------------------------
 
+## Open a plain TCP connection to a Redis server. Needs the `net` capability.
 export fn connect(host, port) = net.connect(host, port)
+## Open a TLS connection to a Redis server - use this for anything over a
+## network you do not control. Needs the `net` capability.
 export fn connect_tls(host, port) = net.connect_tls(host, port)
+## Close the connection.
 export fn close(sock) = net.close(sock)
 
-# command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
-# and you can call it directly for commands without a helper.
+## command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
+## and you can call it directly for commands without a helper.
 export fn command(sock, parts) {
     net.send(sock, encode(parts))
     read_reply(sock)
 }
 
+## Check the server is answering. Returns "PONG".
+##
+## example:
+##   sock = connect("127.0.0.1", 6379)
+##   ping(sock)   # "PONG"
 export fn ping(sock) = command(sock, ["PING"])
+## Store a string value under `key`, replacing anything already there.
 export fn set(sock, key, value) = command(sock, ["SET", key, value])
+## The value at `key`, or null if nothing is stored there.
 export fn get(sock, key) = command(sock, ["GET", key])
+## Remove `key`. Returns 1 if it was there, 0 if it was not.
 export fn del(sock, key) = command(sock, ["DEL", key])
+## Add one to the integer at `key` and return the result. An unset key counts
+## as 0, so the first call gives 1.
 export fn incr(sock, key) = command(sock, ["INCR", key])
+## Subtract one from the integer at `key` and return the result.
 export fn decr(sock, key) = command(sock, ["DECR", key])
+## 1 if the key is set, 0 if it is not.
 export fn exists(sock, key) = command(sock, ["EXISTS", key])
+## Give `key` a lifetime in seconds, after which Redis drops it. Returns 1 if
+## the key was there to expire.
 export fn expire(sock, key, secs) = command(sock, ["EXPIRE", key, secs])
+## Seconds left before `key` expires. -1 means it has no expiry set, -2 means
+## there is no such key.
 export fn ttl(sock, key) = command(sock, ["TTL", key])
+## Every key matching a glob pattern. This walks the entire keyspace, so treat
+## it as a debugging tool rather than something to call in a request.
 export fn keys(sock, pattern) = command(sock, ["KEYS", pattern])
+## Prepend a value to the list at `key`. Returns the list's new length.
 export fn lpush(sock, key, value) = command(sock, ["LPUSH", key, value])
+## Append a value to the list at `key`. Returns the list's new length.
 export fn rpush(sock, key, value) = command(sock, ["RPUSH", key, value])
+## Items from the list at `key`, between `start` and `stop` inclusive.
+## Negative indices count back from the end, so 0 and -1 gets everything.
 export fn lrange(sock, key, start, stop) = command(sock, ["LRANGE", key, start, stop])

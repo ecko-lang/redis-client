@@ -1,10 +1,12 @@
 {
   "module": "github.com/ecko-sh/redis-client",
-  "version": "0.9.1",
+  "version": "0.9.4",
   "entrypoint": "main.ecko",
   "description": "A Redis client (RESP2) written in Ecko, over std.net raw sockets + TLS.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
   "license": "MIT",
-  "capabilities": ["net"],
+  "capabilities": [
+    "net"
+  ],
   "dependencies": {}
 }
