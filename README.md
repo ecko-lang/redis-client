@@ -7,11 +7,11 @@ type.
 ## Install
 
 ```bash
-ecko get github.com/ecko-sh/redis-client
+ecko get github.com/ecko-lang/redis-client
 ```
 
 `ecko get` vendors the package under
-`./vendor/github.com/ecko-sh/redis-client/` and pins a file-tree hash in
+`./vendor/github.com/ecko-lang/redis-client/` and pins a file-tree hash in
 `ecko.sum`.
 
 `ecko get` records this dependency under the alias `redis-client`, which
@@ -23,8 +23,8 @@ the client needs:
 {
   "dependencies": {
     "redis": {
-      "path": "github.com/ecko-sh/redis-client",
-      "version": "v0.9.1",
+      "path": "github.com/ecko-lang/redis-client",
+      "version": "v0.9.5",
       "grant": ["net"]
     }
   }
