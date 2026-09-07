@@ -1,10 +1,12 @@
 # redis - a Redis client (RESP2) written in pure Ecko.
 #
 # No native code: it frames the wire protocol over std.net's raw sockets
-# (connect / connect_tls, send, recv_until, recv_exact) plus the bytes type.
-# The entrypoint of the `redis` package; `export` declares its public API.
+# (connect / connect_tls) read and written with the std.io stream verbs, plus
+# the bytes type. The entrypoint of the `redis` package; `export` declares its
+# public API.
 
 import std.net
+import std.io
 
 # --- RESP encoding: a command is an array of bulk strings ------------------
 # Bulk length is a BYTE count, so a string is framed by its UTF-8 length.
@@ -23,14 +25,22 @@ export fn encode(parts) {
 }
 
 # --- RESP decoding: read exactly one reply, recursing for arrays -----------
-# recv_until gives the type line (through CRLF); bulk payloads are read with
-# recv_exact by their declared length. Bulk values decode as UTF-8 text (the
+# io.read_until gives the type line (through CRLF); bulk payloads are read with
+# io.read_exact by their declared length. Bulk values decode as UTF-8 text (the
 # common case); a binary-safe variant would return the raw bytes instead.
+#
+# Both verbs answer null when the server closed with nothing pending, where the
+# old net.recv_* raised. Redis closes an idle connection on its own `timeout`,
+# so that is an ordinary event and it becomes the error it used to be rather
+# than an index into null a line later.
 #
 # RESP type bytes: 43 '+' simple string, 58 ':' integer, 45 '-' error,
 # 36 '$' bulk string (length-prefixed; -1 = nil), 42 '*' array (-1 = nil).
+fn closed() = error({ kind: "redis", message: "the server closed the connection" })
+
 fn read_reply(sock) {
-    line = net.recv_until(sock, b"\r\n")
+    line = io.read_until(sock, b"\r\n")
+    if is_null(line) { closed() }
     kind = line[0]
     body = string(line[1..len(line) - 2])
     match kind {
@@ -40,7 +50,8 @@ fn read_reply(sock) {
         36 => {
             n = int(body)
             if n == -1 { null } else {
-                data = net.recv_exact(sock, n + 2)
+                data = io.read_exact(sock, n + 2)
+                if is_null(data) { closed() }
                 string(data[0..n])
             }
         }
@@ -66,12 +77,12 @@ export fn connect(host, port) = net.connect(host, port)
 ## network you do not control. Needs the `net` capability.
 export fn connect_tls(host, port) = net.connect_tls(host, port)
 ## Close the connection.
-export fn close(sock) = net.close(sock)
+export fn close(sock) = io.close(sock)
 
 ## command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
 ## and you can call it directly for commands without a helper.
 export fn command(sock, parts) {
-    net.send(sock, encode(parts))
+    io.write(sock, encode(parts))
     read_reply(sock)
 }
 
