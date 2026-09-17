@@ -29,10 +29,10 @@ export fn encode(parts) {
 # io.read_exact by their declared length. Bulk values decode as UTF-8 text (the
 # common case); a binary-safe variant would return the raw bytes instead.
 #
-# Both verbs answer null when the server closed with nothing pending, where the
-# old net.recv_* raised. Redis closes an idle connection on its own `timeout`,
-# so that is an ordinary event and it becomes the error it used to be rather
-# than an index into null a line later.
+# Both verbs answer null when the server closed with nothing pending. Redis
+# closes an idle connection on its own `timeout`, so that is an ordinary event -
+# the null is turned into an error here rather than being indexed into a line
+# later.
 #
 # RESP type bytes: 43 '+' simple string, 58 ':' integer, 45 '-' error,
 # 36 '$' bulk string (length-prefixed; -1 = nil), 42 '*' array (-1 = nil).

@@ -35,7 +35,7 @@ the client needs:
 import redis
 ```
 
-## Use
+## Usage
 
 ```ecko
 import redis
