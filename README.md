@@ -1,30 +1,31 @@
 # Redis Client - Ecko Std Lib Package
 
 A Redis client (RESP2) for [Ecko](https://ecko.sh), written in Ecko. It frames the wire protocol over `std.net`'s raw sockets
-(`connect` / `connect_tls`, `send`, `recv_until`, `recv_exact`) and the `bytes`
-type.
+(`connect` / `connect_tls`), read and written with `std.io`'s `write`,
+`read_until` and `read_exact`, and the `bytes` type.
 
 ## Install
 
 ```bash
-ecko get github.com/ecko-lang/redis-client
+ecko get github.com/ecko-lang/redis-client --as redis
 ```
 
 `ecko get` vendors the package under
 `./vendor/github.com/ecko-lang/redis-client/` and pins a file-tree hash in
 `ecko.sum`.
 
-`ecko get` records this dependency under the alias `redis-client`, which
-isn't a valid import name (hyphens aren't allowed in Ecko identifiers). Alias
-it to `redis` in your `ecko.json` - this also grants the network capability
-the client needs:
+Without `--as`, `ecko get` records this dependency under the alias
+`redis_client` (the repo name with `-` mapped to `_`); `--as redis` is what makes
+`import redis` work. It writes the entry as
+`"redis": "github.com/ecko-lang/redis-client@0.37.0"`. Expand it to the map form in
+your `ecko.json` to grant the network capability the client needs:
 
 ```json
 {
   "dependencies": {
     "redis": {
       "path": "github.com/ecko-lang/redis-client",
-      "version": "v0.9.5",
+      "version": "0.37.0",
       "grant": ["net"]
     }
   }
