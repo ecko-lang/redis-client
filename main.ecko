@@ -1,123 +1,453 @@
-# redis - a Redis client (RESP2) written in pure Ecko.
+# redis-client - a Redis client (RESP2) written in pure Ecko.
 #
 # No native code: it frames the wire protocol over std.net's raw sockets
 # (connect / connect_tls) read and written with the std.io stream verbs, plus
-# the bytes type. The entrypoint of the `redis` package; `export` declares its
-# public API.
+# the bytes type. `export` declares the public API.
 
 import std.net
 import std.io
+import std.str
+
+# --- errors ------------------------------------------------------------------
+
+fn bad_arg(fname, what) = error(
+    { kind: "bug", reason: "bad_argument", message: "redis.{fname}: {what}" },
+)
+
+fn closed(fname) = error(
+    {
+        kind: "redis_client",
+        reason: "closed",
+        message: "redis.{fname}: the server closed the connection before replying in full",
+    },
+)
+
+fn protocol(fname, what) = error(
+    {
+        kind: "redis_client",
+        reason: "protocol",
+        message: "redis.{fname}: the server sent a malformed reply ({what}); close this connection",
+    },
+)
 
 # --- RESP encoding: a command is an array of bulk strings ------------------
-# Bulk length is a BYTE count, so a string is framed by its UTF-8 length.
+# Bulk length is a BYTE count, so a string is framed by its UTF-8 length. Only
+# values with one obvious wire form are accepted: anything else (null, a map, a
+# list, a Bool, a secret) would otherwise be sent as its display text.
 
-fn arg_bytes(a) = if type_of(a) == "bytes" { a } else { bytes(string(a)) }
+fn arg_bytes(fname, a) = match type_of(a) {
+    "bytes" => a
+    "string" => bytes(a)
+    "int" => bytes(string(a))
+    "float" => bytes(string(a))
+    "decimal" => bytes(string(a))
+    "secret" => bad_arg(fname, "a secret cannot be sent as a command argument - reveal() it explicitly if that is what you mean")
+    t => bad_arg(fname, "command arguments must be strings, numbers or bytes, got {t} {a}")
+}
 
-## encode(parts) -> the RESP bytes for a command. Public so you can build a
-## custom command or inspect the wire format without sending it.
-export fn encode(parts) {
+fn encode_as(fname, parts) {
+    unless type_of(parts) == "list" and len(parts) > 0 {
+        bad_arg(
+            fname,
+            "parts must be a non-empty list like [\"GET\", \"key\"], got {type_of(parts)} {parts}",
+        )
+    }
     mut out = bytes("*" + string(len(parts)) + "\r\n")
     for p in parts {
-        pb = arg_bytes(p)
+        pb = arg_bytes(fname, p)
         out = out + bytes("$" + string(len(pb)) + "\r\n") + pb + bytes("\r\n")
     }
     out
 }
 
+## The RESP bytes for a command, without sending it - for building a custom
+## command or inspecting the wire format.
+##
+## Each part is sent as a bulk string: strings by their UTF-8 bytes, numbers
+## as decimal text, bytes unchanged.
+##
+## errors: `bug`/`bad_argument` when `parts` is not a non-empty list, or a part is
+## null, a Bool, a list, a map or a secret.
+##
+## example:
+##   redis.encode(["GET", "k"])   # b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"
+export fn encode(parts) = encode_as("encode", parts)
+
 # --- RESP decoding: read exactly one reply, recursing for arrays -----------
 # io.read_until gives the type line (through CRLF); bulk payloads are read with
-# io.read_exact by their declared length. Bulk values decode as UTF-8 text (the
-# common case); a binary-safe variant would return the raw bytes instead.
+# io.read_exact by their declared length. Both answer null when the server
+# closed with nothing pending; that becomes a `closed` error.
 #
-# Both verbs answer null when the server closed with nothing pending. Redis
-# closes an idle connection on its own `timeout`, so that is an ordinary event -
-# the null is turned into an error here rather than being indexed into a line
-# later.
+# An error reply inside an array (EXEC with a failing command) is read as a
+# Failure value and the rest of the array is still consumed, so the connection
+# stays in step with the server. Only then is it raised.
 #
 # RESP type bytes: 43 '+' simple string, 58 ':' integer, 45 '-' error,
 # 36 '$' bulk string (length-prefixed; -1 = nil), 42 '*' array (-1 = nil).
-fn closed() = error({ kind: "redis", message: "the server closed the connection" })
 
-fn read_reply(sock) {
+type Failure { code: String, text: String }
+
+fn to_int(fname, s) {
+    n = try { int(s) } catch { null }
+    if is_null(n) { protocol(fname, "expected a length or integer, got {s}") }
+    n
+}
+
+fn line_text(fname, b) = try {
+    str.from_utf8(b)
+} catch {
+    protocol(fname, "a reply line is not UTF-8")
+}
+
+fn bulk_value(data, binary) {
+    if binary { return data }
+    text = try { str.from_utf8(data) } catch { null }
+    text ?? data
+}
+
+fn read_value(sock, fname, binary) {
     line = io.read_until(sock, b"\r\n")
-    if is_null(line) { closed() }
+    if is_null(line) { closed(fname) }
+    if len(line) < 3 { protocol(fname, "an empty reply line") }
     kind = line[0]
-    body = string(line[1..len(line) - 2])
+    body = line_text(fname, line[1..len(line) - 2])
     match kind {
         43 => body
-        58 => int(body)
-        45 => error({ kind: "redis", message: body })
+        58 => to_int(fname, body)
+        45 => {
+            (code, _, _) = str.partition(body, " ")
+            Failure(code, body)
+        }
         36 => {
-            n = int(body)
+            n = to_int(fname, body)
+            if n < -1 { protocol(fname, "a bulk length of {n}") }
             if n == -1 { null } else {
-                data = io.read_exact(sock, n + 2)
-                if is_null(data) { closed() }
-                string(data[0..n])
+                data = try { io.read_exact(sock, n + 2) } catch { closed(fname) }
+                if is_null(data) { closed(fname) }
+                if data[n..n + 2] != b"\r\n" { protocol(fname, "a bulk string not ended by CRLF") }
+                bulk_value(data[0..n], binary)
             }
         }
         42 => {
-            n = int(body)
+            n = to_int(fname, body)
+            if n < -1 { protocol(fname, "an array length of {n}") }
             if n == -1 { null } else {
                 mut items = []
                 for i in range(0, n) {
-                    items = push(items, read_reply(sock))
+                    items = push(items, read_value(sock, fname, binary))
                 }
                 items
             }
         }
-        _ => error({ kind: "redis", message: "unknown RESP type: " + string(kind) })
+        _ => protocol(fname, "unknown RESP type byte {kind}")
     }
 }
 
-# --- the client surface ----------------------------------------------------
+fn has_failure(v) = match v {
+    Failure(_, _) => true
+    _ => type_of(v) == "list" and any(v, has_failure)
+}
 
-## Open a plain TCP connection to a Redis server. Needs the `net` capability.
-export fn connect(host, port) = net.connect(host, port)
-## Open a TLS connection to a Redis server - use this for anything over a
-## network you do not control. Needs the `net` capability.
-export fn connect_tls(host, port) = net.connect_tls(host, port)
+fn as_error_values(v) = match v {
+    Failure(code, text) => { kind: "redis_client", reason: "server_error", code: code, message: text }
+    _ => if type_of(v) == "list" { map(v, as_error_values) } else { v }
+}
+
+fn server_error(fname, f: Failure, reply) {
+    mut e = {
+        kind: "redis_client",
+        reason: "server_error",
+        code: f.code,
+        message: "redis.{fname}: the server replied {f.text}",
+    }
+    unless is_null(reply) { e.reply = reply }
+    error(e)
+}
+
+fn first_failure(v) = match v {
+    Failure(_, _) => v
+    _ => {
+        mut found = null
+        for x in v {
+            if is_null(found) and has_failure(x) { found = first_failure(x) }
+        }
+        found
+    }
+}
+
+fn read_reply(sock, fname, binary) {
+    v = read_value(sock, fname, binary)
+    if has_failure(v) {
+        match v {
+            Failure(_, _) => server_error(fname, v, null)
+            _ => server_error(fname, first_failure(v), as_error_values(v))
+        }
+    }
+    v
+}
+
+fn call(sock, fname, parts, binary = false) {
+    io.write(sock, encode_as(fname, parts))
+    read_reply(sock, fname, binary)
+}
+
+# --- connecting and authenticating -----------------------------------------
+
+# This module exports its own `get`, which hides the builtin of that name here.
+fn field(m, k) = if type_of(m) == "map" and k in m { m[k] } else { null }
+
+fn auth_parts(fname, password, username) {
+    pw = match type_of(password) {
+        "secret" => reveal(password)
+        "string" => password
+        t => bad_arg(fname, "password must be a string or a secret, got {t}")
+    }
+    if is_null(username) { ["AUTH", pw] } else {
+        unless type_of(username) == "string" {
+            bad_arg(fname, "username must be a string, got {type_of(username)}")
+        }
+        ["AUTH", username, pw]
+    }
+}
+
+fn do_auth(sock, fname, password, username) {
+    parts = auth_parts(fname, password, username)
+    io.write(sock, encode_as(fname, parts))
+    try { read_reply(sock, fname, false) } catch (e) {
+        if field(e, "kind") == "redis_client" and field(e, "reason") == "server_error" {
+            error(
+                {
+                    kind: "redis_client",
+                    reason: "auth_failed",
+                    code: e.code,
+                    message: "redis.{fname}: the server refused the credentials ({e.code})",
+                },
+            )
+        }
+        error(e)
+    }
+}
+
+fn opened(sock, fname, password, username) {
+    if is_null(password) {
+        unless is_null(username) { bad_arg(fname, "username needs a password") }
+        return sock
+    }
+    try { do_auth(sock, fname, password, username) } catch (e) {
+        try { io.close(sock) }
+        error(e)
+    }
+    sock
+}
+
+## Open a plain TCP connection to a Redis server and return its handle.
+##
+## With `password`, sends `AUTH password` before returning; with `username` as
+## well, `AUTH username password` (Redis 6+ ACL users). `password` may be a
+## String or a `secret`. On a refused login the socket is closed before the
+## error is raised.
+##
+## errors: `net` when the server cannot be reached; `redis_client`/`auth_failed`
+## when the server refuses the credentials; `bug`/`bad_argument` when `password`
+## is not a string or secret, or `username` is given without a password.
+##
+## example:
+##   r = redis.connect("127.0.0.1", 6379, password: secret(os.env("REDIS_PASSWORD")))
+export fn connect(host, port, password = null, username = null) {
+    if not is_null(username) and is_null(password) {
+        bad_arg("connect", "username needs a password")
+    }
+    opened(net.connect(host, port), "connect", password, username)
+}
+
+## Open a TLS connection to a Redis server and return its handle - use this for
+## anything over a network you do not control. The certificate is verified
+## against the OS trust store and the host name.
+##
+## `password` and `username` work as in `connect`.
+##
+## errors: `net` when the server cannot be reached or the TLS handshake fails;
+## `redis_client`/`auth_failed` when the server refuses the credentials;
+## `bug`/`bad_argument` as for `connect`.
+##
+## example:
+##   r = redis.connect_tls("cache.example.com", 6380, password: secret(pw))
+export fn connect_tls(host, port, password = null, username = null) {
+    if not is_null(username) and is_null(password) {
+        bad_arg("connect_tls", "username needs a password")
+    }
+    opened(net.connect_tls(host, port), "connect_tls", password, username)
+}
+
+## Authenticate an open connection: `AUTH password`, or `AUTH username password`
+## when `username` is given. Returns "OK".
+##
+## errors: `redis_client`/`auth_failed` when the server refuses the credentials;
+## `bug`/`bad_argument` when `password` is not a string or secret.
+##
+## example:
+##   redis.auth(r, secret("s3cret"), username: "app")   # "OK"
+export fn auth(sock, password, username = null) = do_auth(sock, "auth", password, username)
+
 ## Close the connection.
+##
+## example:
+##   redis.close(r)
 export fn close(sock) = io.close(sock)
 
-## command(sock, parts) -> one decoded reply. Every helper is a wrapper over it,
-## and you can call it directly for commands without a helper.
-export fn command(sock, parts) {
-    io.write(sock, encode(parts))
-    read_reply(sock)
-}
+## Send any command and return its decoded reply. Every helper is a wrapper
+## over it; call it directly for commands without one.
+##
+## Replies map as: simple string -> String, integer -> Int, bulk string ->
+## String when it is valid UTF-8 and bytes otherwise, nil -> null, array ->
+## List. With `binary: true` every bulk string comes back as bytes. An error
+## reply is raised; one inside an array (a failing command in EXEC) is raised
+## after the whole array has been read, with the full reply attached as `reply`
+## (failed elements as error maps), so the connection stays usable.
+##
+## errors: `redis_client`/`server_error` (with `code`, e.g. "ERR", "WRONGTYPE")
+## when the server answers with an error; `redis_client`/`closed` when the
+## connection drops mid-reply; `redis_client`/`protocol` on a malformed reply;
+## `bug`/`bad_argument` for an argument with no wire form.
+##
+## example:
+##   redis.command(r, ["HSET", "user:1", "name", "Ada"])   # 1
+export fn command(sock, parts, binary = false) = call(sock, "command", parts, binary)
 
 ## Check the server is answering. Returns "PONG".
 ##
+## errors: as for `command`.
+##
 ## example:
-##   sock = connect("127.0.0.1", 6379)
-##   ping(sock)   # "PONG"
-export fn ping(sock) = command(sock, ["PING"])
-## Store a string value under `key`, replacing anything already there.
-export fn set(sock, key, value) = command(sock, ["SET", key, value])
-## The value at `key`, or null if nothing is stored there.
-export fn get(sock, key) = command(sock, ["GET", key])
+##   redis.ping(r)   # "PONG"
+export fn ping(sock) = call(sock, "ping", ["PING"])
+
+## Store `value` under `key`, replacing anything already there. Returns "OK".
+##
+## `ex` sets an expiry in seconds and `px` in milliseconds (positive Ints; give
+## at most one). `value` may be a string, a number or bytes.
+##
+## errors: `bug`/`bad_argument` when both `ex` and `px` are given, either is not
+## a positive Int, or `value` has no wire form; otherwise as for `command`.
+##
+## example:
+##   redis.set(r, "session:42", token, ex: 3600)   # "OK", gone in an hour
+export fn set(sock, key, value, ex = null, px = null) {
+    if not is_null(ex) and not is_null(px) { bad_arg("set", "give ex: or px:, not both") }
+    for (name, v) in [["ex", ex], ["px", px]] {
+        unless is_null(v) or type_of(v) == "int" and v > 0 {
+            bad_arg("set", "{name} must be a positive Int, got {v}")
+        }
+    }
+    mut parts = ["SET", key, value]
+    unless is_null(ex) { parts = parts + ["EX", ex] }
+    unless is_null(px) { parts = parts + ["PX", px] }
+    call(sock, "set", parts)
+}
+
+## The value at `key`, or null if nothing is stored there. A String when the
+## stored value is valid UTF-8, bytes otherwise; `binary: true` always gives bytes.
+##
+## errors: `redis_client`/`server_error` (code "WRONGTYPE") when `key` holds a
+## list or other non-string; otherwise as for `command`.
+##
+## example:
+##   redis.get(r, "greeting")   # "hello"
+export fn get(sock, key, binary = false) = call(sock, "get", ["GET", key], binary)
+
 ## Remove `key`. Returns 1 if it was there, 0 if it was not.
-export fn del(sock, key) = command(sock, ["DEL", key])
+##
+## errors: as for `command`.
+##
+## example:
+##   redis.del(r, "greeting")   # 1
+export fn del(sock, key) = call(sock, "del", ["DEL", key])
+
 ## Add one to the integer at `key` and return the result. An unset key counts
 ## as 0, so the first call gives 1.
-export fn incr(sock, key) = command(sock, ["INCR", key])
+##
+## errors: `redis_client`/`server_error` when the value is not an integer;
+## otherwise as for `command`.
+##
+## example:
+##   redis.incr(r, "hits")   # 1
+export fn incr(sock, key) = call(sock, "incr", ["INCR", key])
+
 ## Subtract one from the integer at `key` and return the result.
-export fn decr(sock, key) = command(sock, ["DECR", key])
+##
+## errors: `redis_client`/`server_error` when the value is not an integer;
+## otherwise as for `command`.
+##
+## example:
+##   redis.decr(r, "stock")   # 9
+export fn decr(sock, key) = call(sock, "decr", ["DECR", key])
+
 ## 1 if the key is set, 0 if it is not.
-export fn exists(sock, key) = command(sock, ["EXISTS", key])
+##
+## errors: as for `command`.
+##
+## example:
+##   redis.exists(r, "greeting")   # 1
+export fn exists(sock, key) = call(sock, "exists", ["EXISTS", key])
+
 ## Give `key` a lifetime in seconds, after which Redis drops it. Returns 1 if
-## the key was there to expire.
-export fn expire(sock, key, secs) = command(sock, ["EXPIRE", key, secs])
+## the key was there to expire, 0 if not.
+##
+## errors: as for `command`.
+##
+## example:
+##   redis.expire(r, "session:42", 60)   # 1
+export fn expire(sock, key, secs) = call(sock, "expire", ["EXPIRE", key, secs])
+
 ## Seconds left before `key` expires. -1 means it has no expiry set, -2 means
 ## there is no such key.
-export fn ttl(sock, key) = command(sock, ["TTL", key])
-## Every key matching a glob pattern. This walks the entire keyspace, so treat
-## it as a debugging tool rather than something to call in a request.
-export fn keys(sock, pattern) = command(sock, ["KEYS", pattern])
+##
+## errors: as for `command`.
+##
+## example:
+##   redis.ttl(r, "session:42")   # 59
+export fn ttl(sock, key) = call(sock, "ttl", ["TTL", key])
+
+## Every key matching a glob pattern, as a List. This walks the entire
+## keyspace, so treat it as a debugging tool rather than something to call in
+## a request.
+##
+## errors: as for `command`.
+##
+## example:
+##   redis.keys(r, "session:*")   # ["session:42"]
+export fn keys(sock, pattern) = call(sock, "keys", ["KEYS", pattern])
+
 ## Prepend a value to the list at `key`. Returns the list's new length.
-export fn lpush(sock, key, value) = command(sock, ["LPUSH", key, value])
+##
+## errors: `redis_client`/`server_error` (code "WRONGTYPE") when `key` holds a
+## non-list; otherwise as for `command`.
+##
+## example:
+##   redis.lpush(r, "jobs", "first")   # 1
+export fn lpush(sock, key, value) = call(sock, "lpush", ["LPUSH", key, value])
+
 ## Append a value to the list at `key`. Returns the list's new length.
-export fn rpush(sock, key, value) = command(sock, ["RPUSH", key, value])
+##
+## errors: `redis_client`/`server_error` (code "WRONGTYPE") when `key` holds a
+## non-list; otherwise as for `command`.
+##
+## example:
+##   redis.rpush(r, "jobs", "last")   # 2
+export fn rpush(sock, key, value) = call(sock, "rpush", ["RPUSH", key, value])
+
 ## Items from the list at `key`, between `start` and `stop` inclusive.
 ## Negative indices count back from the end, so 0 and -1 gets everything.
-export fn lrange(sock, key, start, stop) = command(sock, ["LRANGE", key, start, stop])
+## Items decode as for `get`; `binary: true` gives every item as bytes.
+##
+## errors: `redis_client`/`server_error` (code "WRONGTYPE") when `key` holds a
+## non-list; otherwise as for `command`.
+##
+## example:
+##   redis.lrange(r, "jobs", 0, -1)   # ["first", "last"]
+export fn lrange(sock, key, start, stop, binary = false) = call(
+    sock,
+    "lrange",
+    ["LRANGE", key, start, stop],
+    binary,
+)

@@ -1,4 +1,5 @@
-# A live round-trip against a real Redis on 127.0.0.1:6379. Run it directly:
+# A live round-trip against a real Redis on 127.0.0.1:6379 (needs a running
+# server; set a password with main.connect(..., password: "...")). Run it directly:
 #
 #   ecko example.ecko
 #
@@ -27,6 +28,10 @@ main.del(r, lk)
 main.rpush(r, lk, "apple")
 main.rpush(r, lk, "banana")
 print("LRANGE -> " + string(main.lrange(r, lk, 0, -1)))
+
+print("SET EX -> " + main.set(r, "ecko:example:temp", "brief", ex: 30))
+print("TTL -> " + string(main.ttl(r, "ecko:example:temp")))
+main.del(r, "ecko:example:temp")
 
 print("GET missing -> " + string(main.get(r, "ecko:example:nope")))
 

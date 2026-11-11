@@ -1,0 +1,252 @@
+# Offline tests, run by `ecko test`. Encoding is checked against known RESP
+# bytes; decoding, AUTH and SET options run against a scripted fake server on
+# loopback that answers each request with fixed bytes and records what it got,
+# so no Redis is needed and every run is identical.
+import std.test
+import std.net
+import std.io
+import "../main.ecko"
+
+# Read one RESP command off `c`, returned as its raw bytes.
+fn read_request(c) {
+    head = io.read_until(c, b"\r\n")
+    n = int(string(head[1..len(head) - 2]))
+    mut raw = head
+    for i in range(0, n) {
+        lenline = io.read_until(c, b"\r\n")
+        size = int(string(lenline[1..len(lenline) - 2]))
+        raw = raw + lenline + io.read_exact(c, size + 2)
+    }
+    raw
+}
+
+async fn serve(l, replies) {
+    c = net.accept(l, 5000)
+    mut got = []
+    for reply in replies {
+        got = push(got, read_request(c))
+        io.write(c, reply)
+    }
+    io.close(c)
+    net.stop(l)
+    got
+}
+
+# Start a fake server answering `replies` in order, run `body(conn)` against it,
+# and return { result, requests }.
+fn scripted(replies, body) {
+    l = net.listen(0, "127.0.0.1")
+    task = serve(l, replies)
+    r = main.connect("127.0.0.1", net.port(l))
+    result = try { body(r) } catch (e) { { thrown: e } }
+    requests = await task
+    try { main.close(r) }
+    { result: result, requests: requests }
+}
+
+fn caught(f) = try {
+    f()
+    null
+} catch (e) { e }
+
+# --- encoding ---------------------------------------------------------------
+
+test.case("encodes a no-arg command", fn() {
+    test.eq(main.encode(["PING"]), b"*1\r\n$4\r\nPING\r\n")
+})
+
+test.case("encodes a multi-arg command", fn() {
+    test.eq(main.encode(["SET", "k", "v"]), b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+})
+
+test.case("frames by UTF-8 BYTE length, not char count", fn() {
+    # "café" is 5 bytes (é is 2), so the bulk length is 5, not 4.
+    test.eq(main.encode(["GET", "café"]), b"*2\r\n$3\r\nGET\r\n$5\r\ncaf\xc3\xa9\r\n")
+})
+
+test.case("sends numbers as decimal text", fn() {
+    test.eq(main.encode(["EXPIRE", "k", 60]), b"*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n")
+})
+
+test.case("passes bytes through untouched", fn() {
+    test.eq(
+        main.encode(["SET", "k", b"\x00\xff"]),
+        b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$2\r\n\x00\xff\r\n",
+    )
+})
+
+test.case("refuses null, maps, lists, bools and secrets instead of sending their text", fn() {
+    for bad in [null, { a: 1 }, [1], true, secret("tok")] {
+        e = caught(fn() main.encode(["SET", "k", bad]))
+        test.eq(get(e, "kind"), "bug")
+        test.eq(get(e, "reason"), "bad_argument")
+        test.ok(contains(e.message, "redis.encode"), e.message)
+    }
+})
+
+test.case("refuses a string where a list of parts belongs", fn() {
+    e = caught(fn() main.encode("PING"))
+    test.eq(get(e, "kind"), "bug")
+    test.eq(get(e, "reason"), "bad_argument")
+    test.eq(get(caught(fn() main.encode([])), "reason"), "bad_argument")
+})
+
+# --- decoding ---------------------------------------------------------------
+
+test.case("decodes each reply type", fn() {
+    out = scripted(
+        [
+            b"+PONG\r\n",
+            b":7\r\n",
+            b"$5\r\nhello\r\n",
+            b"$-1\r\n",
+            b"*2\r\n$1\r\na\r\n:2\r\n",
+            b"*-1\r\n",
+        ],
+        fn(r) [
+            main.ping(r),
+            main.incr(r, "n"),
+            main.get(r, "k"),
+            main.get(r, "missing"),
+            main.command(r, ["X"]),
+            main.command(r, ["Y"]),
+        ],
+    )
+    test.eq(out.result, ["PONG", 7, "hello", null, ["a", 2], null])
+})
+
+test.case("an error reply raises redis_client/server_error with its code", fn() {
+    out = scripted(
+        [b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"],
+        fn(r) main.get(r, "l"),
+    )
+    e = out.result.thrown
+    test.eq(e.kind, "redis_client")
+    test.eq(e.reason, "server_error")
+    test.eq(e.code, "WRONGTYPE")
+    test.ok(starts_with(e.message, "redis.get: the server replied WRONGTYPE"), e.message)
+})
+
+test.case("an error inside an array is raised only after the whole array is read", fn() {
+    # EXEC with one failing command; the connection must stay in step, so the
+    # next GET reads its own reply, not the leftover `:1`.
+    out = scripted([b"*2\r\n-ERR inner\r\n:1\r\n", b"$5\r\nhello\r\n"], fn(r) {
+        e = caught(fn() main.command(r, ["EXEC"]))
+        [e, main.get(r, "k")]
+    })
+    (e, next) = out.result
+    test.eq(e.reason, "server_error")
+    test.eq(e.code, "ERR")
+    test.eq(e.reply[1], 1)
+    test.eq(e.reply[0].message, "ERR inner")
+    test.eq(next, "hello")
+})
+
+test.case("a non-UTF-8 bulk reply comes back as bytes", fn() {
+    out = scripted(
+        [b"$3\r\n\xff\xfe\x00\r\n", b"$2\r\nhi\r\n"],
+        fn(r) [main.get(r, "bin"), main.get(r, "k", binary: true)],
+    )
+    test.eq(out.result, [b"\xff\xfe\x00", b"hi"])
+})
+
+test.case("binary: true on lrange gives every item as bytes", fn() {
+    out = scripted(
+        [b"*2\r\n$1\r\na\r\n$1\r\n\xff\r\n"],
+        fn(r) main.lrange(r, "l", 0, -1, binary: true),
+    )
+    test.eq(out.result, [b"a", b"\xff"])
+})
+
+test.case("a server that closes mid-reply raises redis_client/closed", fn() {
+    out = scripted([b"$10\r\nabc"], fn(r) main.get(r, "k"))
+    test.eq(out.result.thrown.kind, "redis_client")
+    test.eq(out.result.thrown.reason, "closed")
+})
+
+test.case("a malformed reply raises redis_client/protocol", fn() {
+    out = scripted([b"?what\r\n"], fn(r) main.ping(r))
+    test.eq(out.result.thrown.reason, "protocol")
+    out2 = scripted([b":abc\r\n"], fn(r) main.incr(r, "k"))
+    test.eq(out2.result.thrown.reason, "protocol")
+})
+
+# --- SET options ------------------------------------------------------------
+
+test.case("set sends EX and PX", fn() {
+    out = scripted(
+        [b"+OK\r\n", b"+OK\r\n", b"+OK\r\n"],
+        fn(r) [
+            main.set(r, "k", "v"),
+            main.set(r, "k", "v", ex: 60),
+            main.set(r, "k", "v", px: 1500),
+        ],
+    )
+    test.eq(out.result, ["OK", "OK", "OK"])
+    test.eq(
+        out.requests,
+        [
+            main.encode(["SET", "k", "v"]),
+            main.encode(["SET", "k", "v", "EX", "60"]),
+            main.encode(["SET", "k", "v", "PX", "1500"]),
+        ],
+    )
+})
+
+test.case("set refuses both ex and px, and a non-positive expiry", fn() {
+    for f in [
+        fn() main.set(null, "k", "v", ex: 1, px: 1),
+        fn() main.set(null, "k", "v", ex: 0),
+        fn() main.set(null, "k", "v", px: 1.5),
+    ] {
+        e = caught(f)
+        test.eq(get(e, "kind"), "bug")
+        test.eq(get(e, "reason"), "bad_argument")
+    }
+})
+
+# --- AUTH -------------------------------------------------------------------
+
+test.case("auth sends a password, or a username and password, revealing a secret", fn() {
+    out = scripted(
+        [b"+OK\r\n", b"+OK\r\n"],
+        fn(r) [main.auth(r, secret("pw")), main.auth(r, "pw", username: "app")],
+    )
+    test.eq(out.result, ["OK", "OK"])
+    test.eq(out.requests, [main.encode(["AUTH", "pw"]), main.encode(["AUTH", "app", "pw"])])
+})
+
+test.case("a refused login raises redis_client/auth_failed without echoing the password", fn() {
+    out = scripted(
+        [b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"],
+        fn(r) main.auth(r, "hunter2"),
+    )
+    e = out.result.thrown
+    test.eq(e.kind, "redis_client")
+    test.eq(e.reason, "auth_failed")
+    test.eq(e.code, "WRONGPASS")
+    test.ok(not contains(e.message, "hunter2"), e.message)
+})
+
+test.case("connect authenticates before returning", fn() {
+    l = net.listen(0, "127.0.0.1")
+    task = serve(l, [b"+OK\r\n", b"+PONG\r\n"])
+    r = main.connect("127.0.0.1", net.port(l), password: "pw", username: "app")
+    test.eq(main.ping(r), "PONG")
+    test.eq((await task)[0], main.encode(["AUTH", "app", "pw"]))
+    main.close(r)
+})
+
+test.case("connect raises auth_failed when the login is refused", fn() {
+    l = net.listen(0, "127.0.0.1")
+    task = serve(l, [b"-ERR invalid password\r\n"])
+    e = caught(fn() main.connect("127.0.0.1", net.port(l), password: "nope"))
+    await task
+    test.eq(get(e, "reason"), "auth_failed")
+})
+
+test.case("connect refuses a username without a password", fn() {
+    e = caught(fn() main.connect("127.0.0.1", 1, username: "app"))
+    test.eq(get(e, "kind"), "bug")
+    test.eq(get(e, "reason"), "bad_argument")
+})
